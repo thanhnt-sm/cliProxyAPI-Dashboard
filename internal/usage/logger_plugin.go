@@ -12,8 +12,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/database"
-	"os"
-	"path/filepath"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
@@ -22,10 +20,11 @@ var statisticsEnabled atomic.Bool
 func init() {
 	statisticsEnabled.Store(true)
 	
-	// Initialize Database (Best effort, using home dir)
-	home, _ := os.UserHomeDir()
-	configDir := filepath.Join(home, ".cliproxy")
-	_ = database.Init(configDir)
+	// Initialize Database (Best effort, using home dir) - REMOVED
+	// We allow the application (main.go) to initialize the database with the correct configuration.
+	// home, _ := os.UserHomeDir()
+	// configDir := filepath.Join(home, ".cliproxy")
+	// _ = database.Init(configDir)
 
 	coreusage.RegisterPlugin(NewLoggerPlugin())
 }

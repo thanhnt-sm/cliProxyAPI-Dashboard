@@ -42,6 +42,7 @@ func Init(configDir string) error {
 			return
 		}
 		dbPath := filepath.Join(configDir, "usage.db")
+		fmt.Printf("DEBUG: Initializing database at %s\n", dbPath)
 		db, err = sql.Open("sqlite", dbPath)
 		if err != nil {
 			return

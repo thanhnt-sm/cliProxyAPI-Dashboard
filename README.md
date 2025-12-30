@@ -23,6 +23,15 @@
 
 ![CLIProxy Dashboard Preview](docs/Homepage.jpg)
 
+
+---
+
+## 📢 Recent Updates (v6.0.1)
+
+- **Fixed Missing Custom UI**: The custom management dashboard is now correctly baked into the Docker image, ensuring it appears for all users without manual volume mounting.
+- **Fixed Usage Persistence**: Resolved an issue where `usage.db` was initializing in an ephemeral directory. Local history now persists correctly across container restarts.
+- **Restored Legacy Data**: Automatically migrated legacy local data (from native runs) to the Docker volume.
+
 ---
 
 ## 📖 Documentation
