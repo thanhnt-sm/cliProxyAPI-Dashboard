@@ -1,0 +1,69 @@
+# Upstream check: compare upstream/main with this repo's main and dispatch release workflow if upstream advanced
+on:
+  schedule:
+    - cron: '0 2 * * *'   # mỗi ngày lúc 02:00 UTC (chỉnh được)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Thay bằng repo gốc bạn fork từ đó, ví dụ original-owner/original-repo
+  UPSTREAM_REPO: 'original-owner/original-repo'
+  # Tên workflow file để dispatch (nếu đổi tên file release.yml thì chỉnh)
+  TARGET_WORKFLOW_FILE: 'release.yml'
+  TARGET_WORKFLOW_REF: 'main'  # ref để chạy workflow dispatch (branch hoặc tag)
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream main
+        run: |
+          set -eux
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git || true
+          git fetch upstream main:upstream-main || true
+          upstream_sha=$(git rev-parse upstream-main)
+          echo "upstream_sha=${upstream_sha}" >> $GITHUB_OUTPUT
+        id: fetch_upstream
+
+      - name: Get local main sha
+        run: |
+          set -eux
+          # ensure local main exists
+          git fetch origin main:local-main || true
+          local_sha=$(git rev-parse local-main)
+          echo "local_sha=${local_sha}" >> $GITHUB_OUTPUT
+        id: fetch_local
+
+      - name: Compare SHAs and dispatch if upstream advanced
+        env:
+          PAT: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -eux
+          upstream_sha=${{ steps.fetch_upstream.outputs.upstream_sha }}
+          local_sha=${{ steps.fetch_local.outputs.local_sha }}
+          echo "upstream: $upstream_sha"
+          echo "local:  $local_sha"
+          if [ "$upstream_sha" = "$local_sha" ]; then
+            echo "Upstream is not ahead. Nothing to do."
+            exit 0
+          fi
+          echo "Upstream has new commits. Dispatching target workflow..."
+          owner_repo="${{ github.repository }}"
+          workflow_file="${{ env.TARGET_WORKFLOW_FILE }}"
+          api="https://api.github.com/repos/${owner_repo}/actions/workflows/${workflow_file}/dispatches"
+          body="{\"ref\":\"${{ env.TARGET_WORKFLOW_REF }}\",\"inputs\":{}}"
+          if [ -z "$PAT" ]; then
+            echo "PAT_TOKEN secret not set. Cannot dispatch workflow automatically." >&2
+            exit 1
+          fi
+          curl -X POST -H "Accept: application/vnd.github+json" -H "Authorization: Bearer $PAT" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$api" -d "$body"
+          echo "Dispatched workflow $workflow_file on ref ${{ env.TARGET_WORKFLOW_REF }}"
