@@ -1,38 +1,140 @@
-name: goreleaser
-
+# Build and Release workflow
 on:
   push:
-    # run only against tags
     tags:
-      - '*'
+      - 'v*'
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create release for (if omitted uses pushed tag)'
+        required: false
+      release_name:
+        description: 'Release name (optional)'
+        required: false
+      release_body:
+        description: 'Release notes/body (optional)'
+        required: false
+      build_command:
+        description: 'Optional custom build command. If set, this command will be run instead of automatic Go build detection.'
+        required: false
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref_name || github.event.inputs.tag || github.sha }}
+  cancel-in-progress: false
+
+env:
+  DEFAULT_GOOS_ARCH: amd64
+
 jobs:
-  goreleaser:
-    runs-on: ubuntu-latest
+  build:
+    name: Build (macOS + Windows)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+    outputs:
+      artifact: ${{ steps.package.outputs.artifact }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - run: git fetch --force --tags
-      - uses: actions/setup-go@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
         with:
-          go-version: '>=1.24.0'
-          cache: true
-      - name: Generate Build Metadata
+          go-version: '1.20'
+
+      - name: Show runner info
         run: |
-          echo VERSION=`git describe --tags --always --dirty` >> $GITHUB_ENV
-          echo COMMIT=`git rev-parse --short HEAD` >> $GITHUB_ENV
-          echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
-      - uses: goreleaser/goreleaser-action@v4
+          echo "Runner OS: $RUNNER_OS"
+          uname -a || true
+
+      - name: Run custom build command (if provided)
+        if: ${{ github.event.inputs.build_command != '' }}
+        run: |
+          set -eux
+          echo "Running custom build command: '${{ github.event.inputs.build_command }}'"
+          ${{ github.event.inputs.build_command }}
+
+      - name: Auto-detect and build Go main packages
+        if: ${{ github.event.inputs.build_command == '' }}
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p build
+          # detect main packages
+          mains=$(go list -f '{{.ImportPath}} {{.Name}}' ./... | awk '$2=="main" {print $1}') || true
+          if [ -z "$mains" ]; then
+            echo "No Go 'main' packages detected. Exiting (no artifacts produced)."
+            exit 0
+          fi
+          echo "Detected main packages: $mains"
+          OS_LABEL="${{ matrix.os }}"
+          if [[ "$OS_LABEL" == "windows-latest" ]]; then
+            GOOS=windows
+            EXT=.exe
+          else
+            GOOS=darwin
+            EXT=
+          fi
+          for pkg in $mains; do
+            base=$(basename "$pkg")
+            outfile=build/${base}-${GOOS}-${{ env.DEFAULT_GOOS_ARCH }}${EXT}
+            echo "Building $pkg -> $outfile"
+            env GOOS=$GOOS GOARCH=${{ env.DEFAULT_GOOS_ARCH }} go build -ldflags "-s -w" -o "$outfile" "$pkg"
+          done
+
+      - name: Package built executable(s)
+        id: package
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p release-artifacts
+          # Copy build outputs if exist
+          if [ -d build ]; then
+            cp -r build/* release-artifacts/ || true
+          fi
+          # If no artifacts were produced, create an empty placeholder
+          if [ -z "$(ls -A release-artifacts || true)" ]; then
+            echo "no-artifact" > release-artifacts/README.txt
+          fi
+          ARTNAME="app-${{ matrix.os }}-${{ github.sha }}.zip"
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            powershell -Command "Compress-Archive -Path release-artifacts\\* -DestinationPath $ARTNAME -Force"
+          else
+            zip -r "$ARTNAME" release-artifacts/*
+          fi
+          echo "artifact=$ARTNAME" >> $GITHUB_OUTPUT
+
+      - name: Upload artifact (per-runner)
+        uses: actions/upload-artifact@v4
         with:
-          distribution: goreleaser
-          version: latest
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ env.VERSION }}
-          COMMIT: ${{ env.COMMIT }}
-          BUILD_DATE: ${{ env.BUILD_DATE }}
+          name: ${{ steps.package.outputs.artifact }}
+          path: ${{ steps.package.outputs.artifact }}
+
+  create-release:
+    name: Create GitHub Release and attach artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded-artifacts
+
+      - name: List downloaded artifacts
+        run: ls -la downloaded-artifacts || true
+
+      - name: Create release and upload assets
+        uses: ncipollo/release-action@v2
+        with:
+          tag: ${{ github.event.inputs.tag || github.ref_name || github.sha }}
+          name: ${{ github.event.inputs.release_name || github.event.inputs.tag || github.ref_name || github.sha }}
+          body: ${{ github.event.inputs.release_body || '' }}
+          files: downloaded-artifacts/**/*
