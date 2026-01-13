@@ -1,0 +1,129 @@
+# Workflow: Build cross-platform executables (macOS + Windows) and attach to Release
+# Triggers: push tag (v*), manual (workflow_dispatch)
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create release for (e.g. v1.2.3). If omitted when triggered by tag push, uses the pushed tag.'
+        required: false
+      release_name:
+        description: 'Release name (optional)'
+        required: false
+      release_body:
+        description: 'Release body / notes (optional)'
+        required: false
+      build_command:
+        description: 'Command to run to build the executable on each runner (default: make build)'
+        required: false
+        default: 'make build'
+
+permissions:
+  contents: write  # needed to create releases / upload assets
+
+concurrency:
+  group: release-${{ github.ref_name || github.event.inputs.tag || github.sha }}
+  cancel-in-progress: false
+
+env:
+  BUILD_COMMAND: ${{ github.event.inputs.build_command || 'make build' }}
+  RELEASE_NAME_INPUT: ${{ github.event.inputs.release_name || '' }}
+  RELEASE_BODY_INPUT: ${{ github.event.inputs.release_body || '' }}
+  # RELEASE_TAG resolves to pushed tag or workflow_dispatch input tag
+  RELEASE_TAG: ${{ github.ref_name != '' && github.ref_name || github.event.inputs.tag }}
+
+jobs:
+  build:
+    name: Build (macOS + Windows)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+    outputs:
+      artifact-names: ${{ steps.set-output.outputs.artifacts }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Optional: setup language-specific runtimes here (examples provided in docs below)
+      # Example:
+      # - uses: actions/setup-go@v4
+      #   with:
+      #     go-version: '1.20'
+
+      - name: Print runner info
+        run: |
+          echo "Runner OS: $RUNNER_OS"
+          echo "Build command: $BUILD_COMMAND"
+
+      - name: Run build command
+        shell: bash
+        run: |
+          # Use the BUILD_COMMAND environment variable (override via workflow_dispatch)
+          echo "Running build command..."
+          set -eux
+          # On Windows GitHub Actions Bash shell is available; if you prefer PowerShell adjust accordingly.
+          $BUILD_COMMAND
+
+      - name: Package built executable(s)
+        id: package
+        run: |
+          set -eux
+          mkdir -p release-artifacts
+          # Detect common output locations - adjust as needed for your repo
+          # - Expect your build to output executables into ./dist or ./build or similar.
+          # Try to pick up files from common folders (adjust to your repo)
+          if [ -d dist ]; then
+            cp -r dist/* release-artifacts/ || true
+          fi
+          if [ -d build ]; then
+            cp -r build/* release-artifacts/ || true
+          fi
+          # If your build outputs a single binary at a known path, copy it explicitly:
+          # cp path/to/your/binary release-artifacts/
+
+          # Create a single zip for the current OS
+          ARTNAME="app-${{ matrix.os }}-${{ github.sha }}.zip"
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            powershell -Command "Compress-Archive -Path release-artifacts\\* -DestinationPath $ARTNAME -Force"
+          else
+            zip -r "$ARTNAME" release-artifacts/*
+          fi
+          echo "artifact=$ARTNAME" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Upload artifact (per-runner)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact }}
+          path: ${{ steps.package.outputs.artifact }}
+
+  create-release:
+    name: Create GitHub Release and upload artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (required for some actions)
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          # downloads all artifacts uploaded by all build matrix jobs
+          path: downloaded-artifacts
+
+      - name: List downloaded artifacts
+        run: |
+          echo "Files in downloaded-artifacts:"
+          ls -la downloaded-artifacts || true
+
+      - name: Create release and upload assets
+        # ncipollo/release-action will create a release and upload files matched by 'files'
+        uses: ncipollo/release-action@v2
+        with:
+          tag: ${{ env.RELEASE_TAG || github.sha }}
+          name: ${{ env.RELEASE_NAME_INPUT || env.RELEASE_TAG || github.sha }}
+          body: ${{ env.RELEASE_BODY_INPUT }}
+          files: downloaded-artifacts/**/*
