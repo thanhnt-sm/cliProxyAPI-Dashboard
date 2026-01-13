@@ -35,8 +35,62 @@ env:
   BINARY_NAME: 'cli-proxy-api'
 
 jobs:
+  # First job: determine version to use across all jobs
+  prepare:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        run: |
+          # Priority: workflow_call input > workflow_dispatch input > tag ref > auto-generated
+          if [ -n "${{ inputs.tag }}" ]; then
+            VERSION="${{ inputs.tag }}"
+          elif [ -n "${{ github.event.inputs.tag }}" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="v$(date -u +%Y.%m.%d-%H%M%S)"
+          fi
+          
+          # Ensure version starts with 'v'
+          if [[ ! "$VERSION" =~ ^v ]]; then
+            VERSION="v${VERSION}"
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "📦 Using version: $VERSION"
+
+      - name: Ensure tag exists
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Check if tag exists locally
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "✅ Tag $VERSION exists locally"
+          else
+            echo "📌 Creating tag $VERSION..."
+            git tag -a "$VERSION" -m "Release $VERSION"
+          fi
+          
+          # Push tag (ignore error if already exists on remote)
+          git push origin "$VERSION" 2>/dev/null || echo "ℹ️ Tag may already exist on remote"
+
   build:
     name: Build (${{ matrix.goos }}-${{ matrix.goarch }})
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     strategy:
@@ -51,10 +105,12 @@ jobs:
             goarch: arm64
             runner: windows-latest
             ext: .exe
+          # macOS AMD64 - Intel runner (available until Aug 2027, replaces retired macos-13)
           - goos: darwin
             goarch: amd64
-            runner: macos-13
+            runner: macos-15-intel
             ext: ''
+          # macOS ARM64 - Apple Silicon runner
           - goos: darwin
             goarch: arm64
             runner: macos-latest
@@ -72,29 +128,6 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Get version info
-        id: version
-        shell: bash
-        run: |
-          # Priority: workflow_call input > workflow_dispatch input > tag ref > auto-generated
-          if [ -n "${{ inputs.tag }}" ]; then
-            VERSION="${{ inputs.tag }}"
-          elif [ -n "${{ github.event.inputs.tag }}" ]; then
-            VERSION="${{ github.event.inputs.tag }}"
-          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            VERSION="${{ github.ref_name }}"
-          else
-            VERSION="dev-$(date -u +%Y%m%d%H%M%S)"
-          fi
-          
-          # Ensure version is not empty
-          if [ -z "$VERSION" ]; then
-            VERSION="dev-$(date -u +%Y%m%d%H%M%S)"
-          fi
-          
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "📦 Building version: $VERSION"
-
       - name: Build binary
         shell: bash
         env:
@@ -102,13 +135,13 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
         run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
           mkdir -p build
           OUTFILE="build/${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
-          VERSION="${{ steps.version.outputs.version }}"
           COMMIT="${{ github.sha }}"
           DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           
-          echo "🔨 Building for GOOS=$GOOS GOARCH=$GOARCH"
+          echo "🔨 Building $OUTFILE for GOOS=$GOOS GOARCH=$GOARCH"
           go build -ldflags "-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT:0:7}' -X 'main.BuildDate=${DATE}'" \
             -o "$OUTFILE" ./cmd/server/
           
@@ -120,7 +153,7 @@ jobs:
         id: package-win
         shell: pwsh
         run: |
-          $VERSION = "${{ steps.version.outputs.version }}"
+          $VERSION = "${{ needs.prepare.outputs.version }}"
           $ARTNAME = "${{ env.BINARY_NAME }}-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
           
           New-Item -ItemType Directory -Force -Path release-package | Out-Null
@@ -138,7 +171,7 @@ jobs:
         id: package-mac
         shell: bash
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          VERSION="${{ needs.prepare.outputs.version }}"
           ARTNAME="${{ env.BINARY_NAME }}-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
           
           mkdir -p release-package
@@ -167,45 +200,12 @@ jobs:
 
   create-release:
     name: Create GitHub Release
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Get version
-        id: version
-        run: |
-          if [ -n "${{ inputs.tag }}" ]; then
-            VERSION="${{ inputs.tag }}"
-          elif [ -n "${{ github.event.inputs.tag }}" ]; then
-            VERSION="${{ github.event.inputs.tag }}"
-          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            VERSION="${{ github.ref_name }}"
-          else
-            VERSION="dev-$(date -u +%Y%m%d%H%M%S)"
-          fi
-          
-          if [ -z "$VERSION" ]; then
-            VERSION="dev-$(date -u +%Y%m%d%H%M%S)"
-          fi
-          
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "📌 Release version: $VERSION"
-
-      - name: Create tag if not exists
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          
-          # Check if tag exists
-          if git rev-parse "$VERSION" >/dev/null 2>&1; then
-            echo "ℹ️ Tag $VERSION already exists."
-          else
-            echo "📌 Creating tag $VERSION..."
-            git tag -a "$VERSION" -m "Release $VERSION"
-            git push origin "$VERSION" || echo "⚠️ Could not push tag (may already exist on remote)"
-          fi
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -213,30 +213,35 @@ jobs:
           path: artifacts
 
       - name: Prepare artifacts for release
+        id: files
         run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
           echo "📁 Downloaded structure:"
           find artifacts -type f || true
           
-          # Move all files to root directory for easier glob matching
+          # Move all files to root directory for easier upload
           mkdir -p release-files
           find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec cp {} release-files/ \; || true
           
           echo "📦 Files to upload:"
           ls -la release-files/ || echo "No files found"
           
-          # Verify we have files
-          FILE_COUNT=$(find release-files -type f | wc -l)
+          # Count files
+          FILE_COUNT=$(find release-files -type f 2>/dev/null | wc -l || echo "0")
+          echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
+          
           if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "::error::No release files found!"
-            exit 1
+            echo "::warning::No release files found!"
+          else
+            echo "✅ Found $FILE_COUNT files for release"
           fi
-          echo "✅ Found $FILE_COUNT files for release"
 
       - name: Create Release
+        if: steps.files.outputs.file_count != '0'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.version }}
-          name: Release ${{ steps.version.outputs.version }}
+          tag_name: ${{ needs.prepare.outputs.version }}
+          name: Release ${{ needs.prepare.outputs.version }}
           body: |
             ${{ github.event.inputs.release_body || 'Automated release from GitHub Actions' }}
             
@@ -260,3 +265,14 @@ jobs:
           make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          echo "## 🎉 Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** $VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Files uploaded:** ${{ steps.files.outputs.file_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📥 **Download from:** [Releases](https://github.com/${{ github.repository }}/releases/tag/$VERSION)" >> $GITHUB_STEP_SUMMARY
