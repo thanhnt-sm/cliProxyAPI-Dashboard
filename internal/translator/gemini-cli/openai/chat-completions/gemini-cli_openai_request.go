@@ -152,7 +152,7 @@ func ConvertOpenAIRequestToGeminiCLI(modelName string, inputRawJSON []byte, _ bo
 			role := m.Get("role").String()
 			content := m.Get("content")
 
-			if role == "system" && len(arr) > 1 {
+			if (role == "system" || role == "developer") && len(arr) > 1 {
 				// system -> request.systemInstruction as a user message style
 				if content.Type == gjson.String {
 					out, _ = sjson.SetBytes(out, "request.systemInstruction.role", "user")
@@ -169,7 +169,7 @@ func ConvertOpenAIRequestToGeminiCLI(modelName string, inputRawJSON []byte, _ bo
 						}
 					}
 				}
-			} else if role == "user" || (role == "system" && len(arr) == 1) {
+			} else if role == "user" || ((role == "system" || role == "developer") && len(arr) == 1) {
 				// Build single user content node to avoid splitting into multiple contents
 				node := []byte(`{"role":"user","parts":[]}`)
 				if content.Type == gjson.String {
@@ -191,6 +191,7 @@ func ConvertOpenAIRequestToGeminiCLI(modelName string, inputRawJSON []byte, _ bo
 									data := pieces[1][7:]
 									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mime_type", mime)
 									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", data)
+									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", geminiCLIFunctionThoughtSignature)
 									p++
 								}
 							}
@@ -218,8 +219,30 @@ func ConvertOpenAIRequestToGeminiCLI(modelName string, inputRawJSON []byte, _ bo
 				if content.Type == gjson.String {
 					// Assistant text -> single model content
 					node, _ = sjson.SetBytes(node, "parts.-1.text", content.String())
-					out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
 					p++
+				} else if content.IsArray() {
+					// Assistant multimodal content (e.g. text + image) -> single model content with parts
+					for _, item := range content.Array() {
+						switch item.Get("type").String() {
+						case "text":
+							node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".text", item.Get("text").String())
+							p++
+						case "image_url":
+							// If the assistant returned an inline data URL, preserve it for history fidelity.
+							imageURL := item.Get("image_url.url").String()
+							if len(imageURL) > 5 { // expect data:...
+								pieces := strings.SplitN(imageURL[5:], ";", 2)
+								if len(pieces) == 2 && len(pieces[1]) > 7 {
+									mime := pieces[0]
+									data := pieces[1][7:]
+									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mime_type", mime)
+									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", data)
+									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", geminiCLIFunctionThoughtSignature)
+									p++
+								}
+							}
+						}
+					}
 				}
 
 				// Tool calls -> single model content with functionCall parts
@@ -244,7 +267,7 @@ func ConvertOpenAIRequestToGeminiCLI(modelName string, inputRawJSON []byte, _ bo
 					out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
 
 					// Append a single tool content combining name + response per function
-					toolNode := []byte(`{"role":"tool","parts":[]}`)
+					toolNode := []byte(`{"role":"user","parts":[]}`)
 					pp := 0
 					for _, fid := range fIDs {
 						if name, ok := tcID2Name[fid]; ok {
@@ -260,6 +283,8 @@ func ConvertOpenAIRequestToGeminiCLI(modelName string, inputRawJSON []byte, _ bo
 					if pp > 0 {
 						out, _ = sjson.SetRawBytes(out, "request.contents.-1", toolNode)
 					}
+				} else {
+					out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
 				}
 			}
 		}

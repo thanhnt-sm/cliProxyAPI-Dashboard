@@ -25,6 +25,9 @@ type SDKConfig struct {
 
 	// APIKeyMetadata provides optional metadata for API keys (e.g. descriptions, tags).
 	APIKeyMetadata map[string]APIKeyMeta `yaml:"api-key-metadata,omitempty" json:"api-key-metadata,omitempty"`
+
+	// Streaming configures server-side streaming behavior (keep-alives and safe bootstrap retries).
+	Streaming StreamingConfig `yaml:"streaming" json:"streaming"`
 }
 
 // APIKeyMeta holds metadata for an API key.
@@ -33,6 +36,18 @@ type APIKeyMeta struct {
 	Description string `yaml:"description" json:"description"`
 	// Tags are arbitrary labels associated with the key.
 	Tags []string `yaml:"tags" json:"tags"`
+}
+
+// StreamingConfig holds server streaming behavior configuration.
+type StreamingConfig struct {
+	// KeepAliveSeconds controls how often the server emits SSE heartbeats (": keep-alive\n\n").
+	// <= 0 disables keep-alives. Default is 0.
+	KeepAliveSeconds int `yaml:"keepalive-seconds,omitempty" json:"keepalive-seconds,omitempty"`
+
+	// BootstrapRetries controls how many times the server may retry a streaming request before any bytes are sent,
+	// to allow auth rotation / transient recovery.
+	// <= 0 disables bootstrap retries. Default is 0.
+	BootstrapRetries int `yaml:"bootstrap-retries,omitempty" json:"bootstrap-retries,omitempty"`
 }
 
 // AccessConfig groups request authentication providers.

@@ -10,6 +10,9 @@ config.yaml
 bin/*
 conv/*
 temp/*
+refs/*
+
+# Storage backends
 pgstore/*
 gitstore/*
 objectstore/*
@@ -30,12 +33,17 @@ auths/*
 
 # Tooling metadata
 .vscode/*
+.codex/*
 .claude/*
 .gemini/*
 .serena/*
 .agent/*
+.agents/*
+.agents/*
+.opencode/*
 .bmad/*
 _bmad/*
+_bmad-output/*
 
 # macOS
 .DS_Store
@@ -49,3 +57,4 @@ _bmad/*
 # Test output
 coverage.out
 *.test
+antigravity-*.json

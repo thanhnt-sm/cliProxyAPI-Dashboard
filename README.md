@@ -140,29 +140,88 @@ CLIProxyAPI includes integrated support for [Amp CLI](https://ampcode.com) and A
 
 ## 🚀 Quick Start
 
-### Option 1: Using Docker (Recommended)
-The easiest way to run the dashboard and proxy.
+### Prerequisites
+- **Docker** (recommended) or **Go 1.21+**
+- A terminal/command line
+
+---
+
+### Step 1: Clone the Repository
 
 ```bash
-# Clone the repository
 git clone https://github.com/0xAstroAlpha/cliProxyAPI-Dashboard.git
 cd cliProxyAPI-Dashboard
-
-# Create config from example
-cp config.example.yaml config.yaml
-
-# Run with Docker Compose
-docker-compose up -d
 ```
 
-### Option 2: Using Go
-Direct execution on your local machine.
+---
+
+### Step 2: Create Configuration File
 
 ```bash
-# Clone the repository
-git clone https://github.com/0xAstroAlpha/cliProxyAPI-Dashboard.git
-cd cliProxyAPI-Dashboard
+cp config.example.yaml config.yaml
+```
 
+---
+
+### Step 3: Review Key Configuration (Optional)
+
+The default `config.yaml` is ready to use with these settings:
+
+| Setting | Default Value | Description |
+|---------|---------------|-------------|
+| `remote-management.secret-key` | `setup-secret-key` | Password to access the dashboard |
+| `remote-management.allow-remote` | `true` | Allow access from any IP |
+| `api-keys[0]` | `sk-antigravity-client-key` | API key for making AI requests |
+| `logging-to-file` | `true` | Enable logs tab in dashboard |
+| `usage-statistics-enabled` | `true` | Enable activity tracking |
+
+> [!TIP]
+> For production, change `secret-key` to a strong password!
+
+---
+
+### Step 4: Build and Run with Docker
+
+```bash
+docker-compose up -d --build
+```
+
+Wait for the build to complete (first time may take 2-3 minutes).
+
+---
+
+### Step 5: Access the Dashboard
+
+Open your browser and go to:
+
+**🌐 [http://localhost:8317/management.html](http://localhost:8317/management.html)**
+
+When prompted, enter the secret key: `setup-secret-key`
+
+---
+
+### Step 6: Test the API
+
+Use curl to verify the API is working:
+
+```bash
+curl -X POST http://localhost:8317/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-antigravity-client-key" \
+  -d '{
+    "model": "gemini-2.5-flash",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+> [!NOTE]
+> The API acts as a proxy. You need to configure AI provider credentials (Gemini, Claude, etc.) in the dashboard's **Config** tab or via `config.yaml` for actual AI responses.
+
+---
+
+### Alternative: Run with Go
+
+```bash
 # Install dependencies
 go mod download
 
@@ -170,17 +229,36 @@ go mod download
 go run cmd/server/main.go
 ```
 
-### 📺 Access the Dashboard
-Once the server is running, the dashboard is available at:
-**[http://localhost:8317/static/management.html](http://localhost:8317/static/management.html)**
+---
 
-> [!IMPORTANT]
-> You **MUST** set a `secret-key` in your `config.yaml` under `remote-management` to access the dashboard.
->
-> ```yaml
-> remote-management:
->   secret-key: "your-secure-key"
-> ```
+## 🔧 Troubleshooting
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| **Dashboard shows 404** | `secret-key` is empty | Set `secret-key` in `config.yaml` |
+| **Popup keeps asking for key** | `allow-remote: false` | Set `allow-remote: true` in `config.yaml` |
+| **Logs tab shows 400 error** | `logging-to-file: false` | Set `logging-to-file: true` |
+| **Activity tab is empty** | `usage-statistics-enabled: false` | Set `usage-statistics-enabled: true` |
+| **Playground returns 401** | Wrong API key | Use `sk-antigravity-client-key` or add your key to `api-keys` |
+| **Dashboard looks different** | Auto-update overwrote files | Ensure `MANAGEMENT_AUTO_UPDATE: "false"` in `docker-compose.yml` |
+| **Changes not applying** | Old Docker image | Run `docker-compose up -d --build` |
+
+---
+
+## 📡 API Endpoints
+
+Once running, the proxy provides these OpenAI-compatible endpoints:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/chat/completions` | POST | Chat completions (GPT/Claude/Gemini) |
+| `/v1/models` | GET | List available models |
+| `/v1/completions` | POST | Text completions |
+| `/management.html` | GET | Dashboard UI |
+
+**Base URL:** `http://localhost:8317`
+
+**Authentication:** `Authorization: Bearer <your-api-key>`
 
 ---
 

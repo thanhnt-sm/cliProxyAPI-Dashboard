@@ -33,6 +33,20 @@ type UsageLog struct {
 	CostUSD        float64   `json:"cost_usd"`
 }
 
+// ManagedKey represents a customer API key with limits.
+type ManagedKey struct {
+	KeyHash            string    `json:"key_hash"`
+	KeyPrefix          string    `json:"key_prefix"`
+	Label              string    `json:"label"`
+	QuotaLimitUSD      float64   `json:"quota_limit_usd"`
+	QuotaLimitRequests int64     `json:"quota_limit_requests"`
+	RateLimitRPM       int64     `json:"rate_limit_rpm"`
+	AllowedModels      []string  `json:"allowed_models"` // JSON array in DB
+	IsActive           bool      `json:"is_active"`
+	ExpiresAt          time.Time `json:"expires_at"`
+	CreatedAt          time.Time `json:"created_at"`
+}
+
 // Init initializes the SQLite database.
 // configDir is detailed path where db file should be stored.
 func Init(configDir string) error {
@@ -48,7 +62,7 @@ func Init(configDir string) error {
 			return
 		}
 
-		// Create table
+		// Create tables
 		query := `
 		CREATE TABLE IF NOT EXISTS usage_logs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +80,19 @@ func Init(configDir string) error {
 			cost_usd REAL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS idx_timestamp ON usage_logs(timestamp DESC);
+
+		CREATE TABLE IF NOT EXISTS managed_keys (
+			key_hash TEXT PRIMARY KEY,
+			key_prefix TEXT,
+			label TEXT,
+			quota_limit_usd REAL DEFAULT 0,
+			quota_limit_requests INTEGER DEFAULT 0,
+			rate_limit_rpm INTEGER DEFAULT 0,
+			allowed_models TEXT,
+			is_active BOOLEAN DEFAULT 1,
+			expires_at DATETIME,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
 		`
 		_, err = db.Exec(query)
 		if err != nil {

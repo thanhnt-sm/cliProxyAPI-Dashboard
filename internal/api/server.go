@@ -6,7 +6,9 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -24,6 +26,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules"
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/amp"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/database"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -33,7 +36,9 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/gemini"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/openai"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/ratelimit"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
@@ -209,13 +214,15 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Resolve logs directory relative to the configuration file directory.
 	var requestLogger logging.RequestLogger
 	var toggle func(bool)
-	if optionState.requestLoggerFactory != nil {
-		requestLogger = optionState.requestLoggerFactory(cfg, configFilePath)
-	}
-	if requestLogger != nil {
-		engine.Use(middleware.RequestLoggingMiddleware(requestLogger))
-		if setter, ok := requestLogger.(interface{ SetEnabled(bool) }); ok {
-			toggle = setter.SetEnabled
+	if !cfg.CommercialMode {
+		if optionState.requestLoggerFactory != nil {
+			requestLogger = optionState.requestLoggerFactory(cfg, configFilePath)
+		}
+		if requestLogger != nil {
+			engine.Use(middleware.RequestLoggingMiddleware(requestLogger))
+			if setter, ok := requestLogger.(interface{ SetEnabled(bool) }); ok {
+				toggle = setter.SetEnabled
+			}
 		}
 	}
 
@@ -316,6 +323,7 @@ func (s *Server) setupRoutes() {
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
 	v1.Use(AuthMiddleware(s.accessManager))
+	v1.Use(middleware.EnforceModelPolicy())
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
@@ -328,6 +336,7 @@ func (s *Server) setupRoutes() {
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
 	v1beta.Use(AuthMiddleware(s.accessManager))
+	v1beta.Use(middleware.EnforceModelPolicy())
 	{
 		v1beta.GET("/models", geminiHandlers.GeminiModels)
 		v1beta.POST("/models/*action", geminiHandlers.GeminiHandler)
@@ -483,6 +492,9 @@ func (s *Server) registerManagementRoutes() {
 	mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
 	{
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
+		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
+		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
+
 		mgmt.GET("/activity", s.mgmt.GetActivityLogs)
 		mgmt.GET("/activity/export", s.mgmt.ExportActivityLogs)
 		mgmt.GET("/stats/trends", s.mgmt.GetUsageTrends)
@@ -501,6 +513,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/logging-to-file", s.mgmt.PutLoggingToFile)
 		mgmt.PATCH("/logging-to-file", s.mgmt.PutLoggingToFile)
 
+		mgmt.GET("/logs-max-total-size-mb", s.mgmt.GetLogsMaxTotalSizeMB)
+		mgmt.PUT("/logs-max-total-size-mb", s.mgmt.PutLogsMaxTotalSizeMB)
+		mgmt.PATCH("/logs-max-total-size-mb", s.mgmt.PutLogsMaxTotalSizeMB)
+
 		mgmt.GET("/usage-statistics-enabled", s.mgmt.GetUsageStatisticsEnabled)
 		mgmt.PUT("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
 		mgmt.PATCH("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
@@ -509,6 +525,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/proxy-url", s.mgmt.PutProxyURL)
 		mgmt.PATCH("/proxy-url", s.mgmt.PutProxyURL)
 		mgmt.DELETE("/proxy-url", s.mgmt.DeleteProxyURL)
+
+		mgmt.POST("/api-call", s.mgmt.APICall)
 
 		mgmt.GET("/quota-exceeded/switch-project", s.mgmt.GetSwitchProject)
 		mgmt.PUT("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)
@@ -537,6 +555,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/logs", s.mgmt.DeleteLogs)
 		mgmt.GET("/request-error-logs", s.mgmt.GetRequestErrorLogs)
 		mgmt.GET("/request-error-logs/:name", s.mgmt.DownloadRequestErrorLog)
+		mgmt.GET("/request-log-by-id/:id", s.mgmt.GetRequestLogByID)
 		mgmt.GET("/request-log", s.mgmt.GetRequestLog)
 		mgmt.PUT("/request-log", s.mgmt.PutRequestLog)
 		mgmt.PATCH("/request-log", s.mgmt.PutRequestLog)
@@ -563,6 +582,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/ampcode/force-model-mappings", s.mgmt.GetAmpForceModelMappings)
 		mgmt.PUT("/ampcode/force-model-mappings", s.mgmt.PutAmpForceModelMappings)
 		mgmt.PATCH("/ampcode/force-model-mappings", s.mgmt.PutAmpForceModelMappings)
+		mgmt.GET("/ampcode/upstream-api-keys", s.mgmt.GetAmpUpstreamAPIKeys)
+		mgmt.PUT("/ampcode/upstream-api-keys", s.mgmt.PutAmpUpstreamAPIKeys)
+		mgmt.PATCH("/ampcode/upstream-api-keys", s.mgmt.PatchAmpUpstreamAPIKeys)
+		mgmt.DELETE("/ampcode/upstream-api-keys", s.mgmt.DeleteAmpUpstreamAPIKeys)
 
 		mgmt.GET("/request-retry", s.mgmt.GetRequestRetry)
 		mgmt.PUT("/request-retry", s.mgmt.PutRequestRetry)
@@ -570,6 +593,14 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/max-retry-interval", s.mgmt.GetMaxRetryInterval)
 		mgmt.PUT("/max-retry-interval", s.mgmt.PutMaxRetryInterval)
 		mgmt.PATCH("/max-retry-interval", s.mgmt.PutMaxRetryInterval)
+
+		mgmt.GET("/force-model-prefix", s.mgmt.GetForceModelPrefix)
+		mgmt.PUT("/force-model-prefix", s.mgmt.PutForceModelPrefix)
+		mgmt.PATCH("/force-model-prefix", s.mgmt.PutForceModelPrefix)
+
+		mgmt.GET("/routing/strategy", s.mgmt.GetRoutingStrategy)
+		mgmt.PUT("/routing/strategy", s.mgmt.PutRoutingStrategy)
+		mgmt.PATCH("/routing/strategy", s.mgmt.PutRoutingStrategy)
 
 		mgmt.GET("/claude-api-key", s.mgmt.GetClaudeKeys)
 		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)
@@ -586,10 +617,20 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/openai-compatibility", s.mgmt.PatchOpenAICompat)
 		mgmt.DELETE("/openai-compatibility", s.mgmt.DeleteOpenAICompat)
 
+		mgmt.GET("/vertex-api-key", s.mgmt.GetVertexCompatKeys)
+		mgmt.PUT("/vertex-api-key", s.mgmt.PutVertexCompatKeys)
+		mgmt.PATCH("/vertex-api-key", s.mgmt.PatchVertexCompatKey)
+		mgmt.DELETE("/vertex-api-key", s.mgmt.DeleteVertexCompatKey)
+
 		mgmt.GET("/oauth-excluded-models", s.mgmt.GetOAuthExcludedModels)
 		mgmt.PUT("/oauth-excluded-models", s.mgmt.PutOAuthExcludedModels)
 		mgmt.PATCH("/oauth-excluded-models", s.mgmt.PatchOAuthExcludedModels)
 		mgmt.DELETE("/oauth-excluded-models", s.mgmt.DeleteOAuthExcludedModels)
+
+		mgmt.GET("/oauth-model-mappings", s.mgmt.GetOAuthModelMappings)
+		mgmt.PUT("/oauth-model-mappings", s.mgmt.PutOAuthModelMappings)
+		mgmt.PATCH("/oauth-model-mappings", s.mgmt.PatchOAuthModelMappings)
+		mgmt.DELETE("/oauth-model-mappings", s.mgmt.DeleteOAuthModelMappings)
 
 		mgmt.GET("/auth-files", s.mgmt.ListAuthFiles)
 		mgmt.GET("/auth-files/models", s.mgmt.GetAuthFileModels)
@@ -600,6 +641,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
+		mgmt.GET("/advanced-keys", s.mgmt.ListManagedKeys)
+		mgmt.POST("/advanced-keys", s.mgmt.CreateManagedKey)
+		mgmt.DELETE("/advanced-keys/:hash", s.mgmt.DeleteManagedKey)
+
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
 		mgmt.GET("/codex-auth-url", s.mgmt.RequestCodexToken)
 		mgmt.GET("/gemini-cli-auth-url", s.mgmt.RequestGeminiCLIToken)
@@ -609,6 +654,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/iflow-auth-url", s.mgmt.RequestIFlowCookieToken)
 		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
+		mgmt.GET("/registry/models", s.mgmt.ListRegistryModels)
 	}
 }
 
@@ -866,7 +912,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	}
 
 	if oldCfg == nil || oldCfg.LoggingToFile != cfg.LoggingToFile || oldCfg.LogsMaxTotalSizeMB != cfg.LogsMaxTotalSizeMB {
-		if err := logging.ConfigureLogOutput(cfg.LoggingToFile, cfg.LogsMaxTotalSizeMB); err != nil {
+		if err := logging.ConfigureLogOutput(cfg); err != nil {
 			log.Errorf("failed to reconfigure log output: %v", err)
 		} else {
 			if oldCfg == nil {
@@ -977,8 +1023,12 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		log.Warnf("amp module is nil, skipping config update")
 	}
 
-	// Count client sources from configuration and auth directory
-	authFiles := util.CountAuthFiles(cfg.AuthDir)
+	// Count client sources from configuration and auth store.
+	tokenStore := sdkAuth.GetTokenStore()
+	if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok {
+		dirSetter.SetBaseDir(cfg.AuthDir)
+	}
+	authEntries := util.CountAuthFiles(context.Background(), tokenStore)
 	geminiAPIKeyCount := len(cfg.GeminiKey)
 	claudeAPIKeyCount := len(cfg.ClaudeKey)
 	codexAPIKeyCount := len(cfg.CodexKey)
@@ -989,10 +1039,10 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		openAICompatCount += len(entry.APIKeyEntries)
 	}
 
-	total := authFiles + geminiAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + vertexAICompatCount + openAICompatCount
-	fmt.Printf("server clients and configuration updated: %d clients (%d auth files + %d Gemini API keys + %d Claude API keys + %d Codex keys + %d Vertex-compat + %d OpenAI-compat)\n",
+	total := authEntries + geminiAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + vertexAICompatCount + openAICompatCount
+	fmt.Printf("server clients and configuration updated: %d clients (%d auth entries + %d Gemini API keys + %d Claude API keys + %d Codex keys + %d Vertex-compat + %d OpenAI-compat)\n",
 		total,
-		authFiles,
+		authEntries,
 		geminiAPIKeyCount,
 		claudeAPIKeyCount,
 		codexAPIKeyCount,
@@ -1015,32 +1065,97 @@ func (s *Server) SetWebsocketAuthChangeHandler(fn func(bool, bool)) {
 // it allows all requests (legacy behaviour).
 func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if manager == nil {
-			c.Next()
-			return
-		}
-
-		result, err := manager.Authenticate(c.Request.Context(), c.Request)
-		if err == nil {
-			if result != nil {
+		// 1. Try Standard Static Config Auth
+		if manager != nil {
+			result, err := manager.Authenticate(c.Request.Context(), c.Request)
+			if err == nil && result != nil {
 				c.Set("apiKey", result.Principal)
 				c.Set("accessProvider", result.Provider)
 				if len(result.Metadata) > 0 {
 					c.Set("accessMetadata", result.Metadata)
 				}
+				c.Next()
+				return
 			}
-			c.Next()
-			return
+			// If error is NOT "Invalid" or "No Creds", legitimate error?
+			// Actually manager returns specific errors. We proceed to check DB if invalid.
 		}
 
-		switch {
-		case errors.Is(err, sdkaccess.ErrNoCredentials):
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Missing API key"})
-		case errors.Is(err, sdkaccess.ErrInvalidCredential):
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid API key"})
-		default:
-			log.Errorf("authentication middleware error: %v", err)
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Authentication service error"})
+		// 2. Try Managed Keys (Database)
+		// Extract key manually since manager failed/didn't find it.
+		key := extractAPIKey(c.Request)
+		if key != "" {
+			// Hash key (using SHA256 for speed, consistent with our design)
+			// Note: We need to ensure we use same hash as creation.
+			hashed := hashKey(key)
+
+			managedKey, err := database.GetManagedKey(hashed)
+			if err == nil && managedKey != nil {
+				// 2a. Check Active
+				if !managedKey.IsActive {
+					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "API key is disabled"})
+					return
+				}
+
+				// 2b. Check Expiration
+				if !managedKey.ExpiresAt.IsZero() && time.Now().After(managedKey.ExpiresAt) {
+					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "API key has expired"})
+					return
+				}
+
+				// 2c. Check Quota (Usage)
+				// We need to query total usage for this key.
+				// Since we don't have usage in memory yet, we query DB.
+				// Optimization: We could cache this or use a separate "usage_counter" table.
+				// For now, simple query.
+				requests, cost, err := database.GetUsageForKey(managedKey.KeyPrefix) // Prefix matching used for logging
+				if err == nil {
+					if managedKey.QuotaLimitUSD > 0 && cost >= managedKey.QuotaLimitUSD {
+						c.AbortWithStatusJSON(http.StatusPaymentRequired, gin.H{"error": "Quota limit exceeded"})
+						return
+					}
+					if managedKey.QuotaLimitRequests > 0 && requests >= managedKey.QuotaLimitRequests {
+						c.AbortWithStatusJSON(http.StatusPaymentRequired, gin.H{"error": "Request quota limit exceeded"})
+						return
+					}
+				}
+
+				// 2d. Check Rate Limit (RPM)
+				if managedKey.RateLimitRPM > 0 {
+					if !ratelimit.GlobalManager.Allow(managedKey.KeyHash, int(managedKey.RateLimitRPM)) {
+						// 429 Too Many Requests
+						c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "Rate limit exceeded"})
+						return
+					}
+				}
+
+
+				// We will implement RateLimiter in a separate step or file.
+				
+				// Success
+				c.Set("apiKey", "managed:"+managedKey.Label) // distinguishing prefix
+				c.Set("accessProvider", "managed")
+				c.Set("managedKey", managedKey) // Store full object for Model middleware
+				c.Next()
+				return
+			}
 		}
+
+		// 3. Fallback to Unauthorized
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid API key"})
 	}
+}
+
+func extractAPIKey(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimPrefix(auth, "Bearer ")
+	}
+	return r.Header.Get("X-API-Key")
+}
+
+func hashKey(key string) string {
+	h := sha256.New()
+	h.Write([]byte(key))
+	return hex.EncodeToString(h.Sum(nil))
 }

@@ -1,7 +1,7 @@
 services:
   cli-proxy-api:
     image: ${CLI_PROXY_IMAGE:-eceasy/cli-proxy-api:latest}
-    pull_policy: always
+    # Removed pull_policy: always to prioritize local builds with custom static files
     build:
       context: .
       dockerfile: Dockerfile
@@ -27,5 +27,7 @@ services:
       - ./config.yaml:/CLIProxyAPI/config.yaml
       - ${HOME}/.cli-proxy-api:/root/.cli-proxy-api
       - ./logs:/CLIProxyAPI/logs
+      # Mount local static files to use custom dashboard
+      # This ensures your custom management.html is used instead of the one baked into the image
       - ./static:/CLIProxyAPI/static
     restart: unless-stopped
