@@ -1,24 +1,27 @@
-# Build and Release workflow
+# Manual/Automatic Build and Release workflow for Windows + macOS
+name: Build Release
+
 on:
   push:
     tags:
       - 'v*'
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to create release for (if omitted uses pushed tag)'
+        description: 'Tag/version for release (e.g., v1.0.0). Leave empty for auto-generated.'
         required: false
+        default: ''
       release_name:
         description: 'Release name (optional)'
         required: false
       release_body:
-        description: 'Release notes/body (optional)'
+        description: 'Release notes (optional)'
         required: false
-      build_command:
-        description: 'Optional custom build command. If set, this command will be run instead of automatic Go build detection.'
-        required: false
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
 
 permissions:
   contents: write
@@ -28,17 +31,35 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  DEFAULT_GOOS_ARCH: amd64
+  GO_VERSION: '1.24'
+  BINARY_NAME: 'cli-proxy-api'
 
 jobs:
   build:
-    name: Build (macOS + Windows)
-    runs-on: ${{ matrix.os }}
+    name: Build (${{ matrix.goos }}-${{ matrix.goarch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
-    outputs:
-      artifact: ${{ steps.package.outputs.artifact }}
+        include:
+          - goos: windows
+            goarch: amd64
+            runner: windows-latest
+            ext: .exe
+          - goos: windows
+            goarch: arm64
+            runner: windows-latest
+            ext: .exe
+          - goos: darwin
+            goarch: amd64
+            runner: macos-13
+            ext: ''
+          - goos: darwin
+            goarch: arm64
+            runner: macos-latest
+            ext: ''
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -46,95 +67,196 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.20'
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
 
-      - name: Show runner info
-        run: |
-          echo "Runner OS: $RUNNER_OS"
-          uname -a || true
-
-      - name: Run custom build command (if provided)
-        if: ${{ github.event.inputs.build_command != '' }}
-        run: |
-          set -eux
-          echo "Running custom build command: '${{ github.event.inputs.build_command }}'"
-          ${{ github.event.inputs.build_command }}
-
-      - name: Auto-detect and build Go main packages
-        if: ${{ github.event.inputs.build_command == '' }}
+      - name: Get version info
+        id: version
         shell: bash
         run: |
-          set -eux
+          # Priority: workflow_call input > workflow_dispatch input > tag ref > auto-generated
+          if [ -n "${{ inputs.tag }}" ]; then
+            VERSION="${{ inputs.tag }}"
+          elif [ -n "${{ github.event.inputs.tag }}" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="dev-$(date -u +%Y%m%d%H%M%S)"
+          fi
+          
+          # Ensure version is not empty
+          if [ -z "$VERSION" ]; then
+            VERSION="dev-$(date -u +%Y%m%d%H%M%S)"
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "📦 Building version: $VERSION"
+
+      - name: Build binary
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
           mkdir -p build
-          # detect main packages
-          mains=$(go list -f '{{.ImportPath}} {{.Name}}' ./... | awk '$2=="main" {print $1}') || true
-          if [ -z "$mains" ]; then
-            echo "No Go 'main' packages detected. Exiting (no artifacts produced)."
-            exit 0
-          fi
-          echo "Detected main packages: $mains"
-          OS_LABEL="${{ matrix.os }}"
-          if [[ "$OS_LABEL" == "windows-latest" ]]; then
-            GOOS=windows
-            EXT=.exe
-          else
-            GOOS=darwin
-            EXT=
-          fi
-          for pkg in $mains; do
-            base=$(basename "$pkg")
-            outfile=build/${base}-${GOOS}-${{ env.DEFAULT_GOOS_ARCH }}${EXT}
-            echo "Building $pkg -> $outfile"
-            env GOOS=$GOOS GOARCH=${{ env.DEFAULT_GOOS_ARCH }} go build -ldflags "-s -w" -o "$outfile" "$pkg"
-          done
+          OUTFILE="build/${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          COMMIT="${{ github.sha }}"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          
+          echo "🔨 Building for GOOS=$GOOS GOARCH=$GOARCH"
+          go build -ldflags "-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT:0:7}' -X 'main.BuildDate=${DATE}'" \
+            -o "$OUTFILE" ./cmd/server/
+          
+          echo "✅ Built: $OUTFILE"
+          ls -la build/
 
-      - name: Package built executable(s)
-        id: package
+      - name: Package artifact (Windows)
+        if: matrix.goos == 'windows'
+        id: package-win
+        shell: pwsh
+        run: |
+          $VERSION = "${{ steps.version.outputs.version }}"
+          $ARTNAME = "${{ env.BINARY_NAME }}-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          
+          New-Item -ItemType Directory -Force -Path release-package | Out-Null
+          Copy-Item build/* release-package/
+          if (Test-Path LICENSE) { Copy-Item LICENSE release-package/ }
+          if (Test-Path README.md) { Copy-Item README.md release-package/ }
+          if (Test-Path config.example.yaml) { Copy-Item config.example.yaml release-package/ }
+          
+          Compress-Archive -Path release-package/* -DestinationPath "${ARTNAME}.zip" -Force
+          Write-Host "📦 Created: ${ARTNAME}.zip"
+          echo "artifact=${ARTNAME}.zip" >> $env:GITHUB_OUTPUT
+
+      - name: Package artifact (macOS)
+        if: matrix.goos == 'darwin'
+        id: package-mac
         shell: bash
         run: |
-          set -eux
-          mkdir -p release-artifacts
-          # Copy build outputs if exist
-          if [ -d build ]; then
-            cp -r build/* release-artifacts/ || true
-          fi
-          # If no artifacts were produced, create an empty placeholder
-          if [ -z "$(ls -A release-artifacts || true)" ]; then
-            echo "no-artifact" > release-artifacts/README.txt
-          fi
-          ARTNAME="app-${{ matrix.os }}-${{ github.sha }}.zip"
-          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            powershell -Command "Compress-Archive -Path release-artifacts\\* -DestinationPath $ARTNAME -Force"
-          else
-            zip -r "$ARTNAME" release-artifacts/*
-          fi
-          echo "artifact=$ARTNAME" >> $GITHUB_OUTPUT
+          VERSION="${{ steps.version.outputs.version }}"
+          ARTNAME="${{ env.BINARY_NAME }}-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          
+          mkdir -p release-package
+          cp build/* release-package/
+          cp LICENSE README.md config.example.yaml release-package/ 2>/dev/null || true
+          
+          tar -czvf "${ARTNAME}.tar.gz" -C release-package .
+          echo "📦 Created: ${ARTNAME}.tar.gz"
+          echo "artifact=${ARTNAME}.tar.gz" >> $GITHUB_OUTPUT
 
-      - name: Upload artifact (per-runner)
+      - name: Upload artifact (Windows)
+        if: matrix.goos == 'windows'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.package.outputs.artifact }}
-          path: ${{ steps.package.outputs.artifact }}
+          name: ${{ steps.package-win.outputs.artifact }}
+          path: ${{ steps.package-win.outputs.artifact }}
+          retention-days: 7
+
+      - name: Upload artifact (macOS)
+        if: matrix.goos == 'darwin'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package-mac.outputs.artifact }}
+          path: ${{ steps.package-mac.outputs.artifact }}
+          retention-days: 7
 
   create-release:
-    name: Create GitHub Release and attach artifacts
+    name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            VERSION="${{ inputs.tag }}"
+          elif [ -n "${{ github.event.inputs.tag }}" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="dev-$(date -u +%Y%m%d%H%M%S)"
+          fi
+          
+          if [ -z "$VERSION" ]; then
+            VERSION="dev-$(date -u +%Y%m%d%H%M%S)"
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "📌 Release version: $VERSION"
+
+      - name: Create tag if not exists
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          
+          # Check if tag exists
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "ℹ️ Tag $VERSION already exists."
+          else
+            echo "📌 Creating tag $VERSION..."
+            git tag -a "$VERSION" -m "Release $VERSION"
+            git push origin "$VERSION" || echo "⚠️ Could not push tag (may already exist on remote)"
+          fi
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: downloaded-artifacts
+          path: artifacts
 
-      - name: List downloaded artifacts
-        run: ls -la downloaded-artifacts || true
+      - name: Prepare artifacts for release
+        run: |
+          echo "📁 Downloaded structure:"
+          find artifacts -type f || true
+          
+          # Move all files to root directory for easier glob matching
+          mkdir -p release-files
+          find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec cp {} release-files/ \; || true
+          
+          echo "📦 Files to upload:"
+          ls -la release-files/ || echo "No files found"
+          
+          # Verify we have files
+          FILE_COUNT=$(find release-files -type f | wc -l)
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "::error::No release files found!"
+            exit 1
+          fi
+          echo "✅ Found $FILE_COUNT files for release"
 
-      - name: Create release and upload assets
-        uses: ncipollo/release-action@v2
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
-          tag: ${{ github.event.inputs.tag || github.ref_name || github.sha }}
-          name: ${{ github.event.inputs.release_name || github.event.inputs.tag || github.ref_name || github.sha }}
-          body: ${{ github.event.inputs.release_body || '' }}
-          files: downloaded-artifacts/**/*
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Release ${{ steps.version.outputs.version }}
+          body: |
+            ${{ github.event.inputs.release_body || 'Automated release from GitHub Actions' }}
+            
+            ## 📥 Downloads
+            | Platform | Architecture | File |
+            |----------|--------------|------|
+            | Windows | AMD64 (x64) | `cli-proxy-api-*-windows-amd64.zip` |
+            | Windows | ARM64 | `cli-proxy-api-*-windows-arm64.zip` |
+            | macOS | AMD64 (Intel) | `cli-proxy-api-*-darwin-amd64.tar.gz` |
+            | macOS | ARM64 (Apple Silicon) | `cli-proxy-api-*-darwin-arm64.tar.gz` |
+            
+            ## 🔧 Installation
+            1. Download the appropriate file for your platform
+            2. Extract the archive
+            3. Run the `cli-proxy-api` executable
+          files: release-files/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
