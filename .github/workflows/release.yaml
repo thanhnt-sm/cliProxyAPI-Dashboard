@@ -1,5 +1,17 @@
-# Manual/Automatic Build and Release workflow for Windows + macOS
-name: Build Release
+# 🚀 Universal Cross-Platform Build & Release Workflow
+# 
+# ✅ Copy this file to ANY GitHub repository's .github/workflows/ folder
+# ✅ Supports: Go, Rust, Node.js, Python (auto-detected)
+# ✅ Outputs: Windows (.exe/.zip), macOS (.tar.gz + .dmg)
+# ✅ Architectures: amd64 + arm64
+#
+# 📋 Requirements per language:
+# - Go: go.mod file
+# - Rust: Cargo.toml file  
+# - Node.js: package.json with "build" script
+# - Python: requirements.txt + main.py or app.py
+
+name: Build & Release
 
 on:
   push:
@@ -8,15 +20,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag/version for release (e.g., v1.0.0). Leave empty for auto-generated.'
+        description: 'Version tag (e.g., v1.0.0). Empty = auto-generate'
         required: false
         default: ''
-      release_name:
-        description: 'Release name (optional)'
-        required: false
-      release_body:
-        description: 'Release notes (optional)'
-        required: false
+      create_dmg:
+        description: 'Create macOS DMG installer'
+        type: boolean
+        default: true
   workflow_call:
     inputs:
       tag:
@@ -31,26 +41,106 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  GO_VERSION: '1.24'
-  BINARY_NAME: 'cli-proxy-api'
-
+  # ===== CONFIGURATION (auto-detected if empty) =====
+  PROJECT_NAME: ''          # Binary/app name
+  MAIN_FILE: ''             # Entry point (main.go, main.py, src/main.rs, etc.)
+  
 jobs:
-  # First job: determine version to use across all jobs
-  prepare:
-    name: Prepare Release
+  # ============================================================
+  # DETECT: Auto-detect project language and settings
+  # ============================================================
+  detect:
+    name: Detect Project
     runs-on: ubuntu-latest
     outputs:
+      language: ${{ steps.detect.outputs.language }}
+      project_name: ${{ steps.detect.outputs.project_name }}
+      main_file: ${{ steps.detect.outputs.main_file }}
       version: ${{ steps.version.outputs.version }}
+      go_version: ${{ steps.detect.outputs.go_version }}
+      node_version: ${{ steps.detect.outputs.node_version }}
+      python_version: ${{ steps.detect.outputs.python_version }}
+      rust_version: ${{ steps.detect.outputs.rust_version }}
+    
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      - name: Detect language and settings
+        id: detect
+        run: |
+          # Detect language
+          if [ -f "go.mod" ]; then
+            LANG="go"
+            GO_VER=$(grep -E '^go [0-9]+\.[0-9]+' go.mod | awk '{print $2}' || echo "1.24")
+            echo "go_version=$GO_VER" >> $GITHUB_OUTPUT
+            
+            # Detect project name from module
+            NAME=$(grep -E '^module ' go.mod | awk '{print $2}' | xargs basename)
+            
+            # Detect main file
+            if [ -f "main.go" ]; then
+              MAIN="."
+            elif [ -d "cmd" ]; then
+              MAIN=$(find cmd -name "main.go" -type f | head -1 | xargs dirname 2>/dev/null || echo "cmd/server")
+            else
+              MAIN="."
+            fi
+            
+          elif [ -f "Cargo.toml" ]; then
+            LANG="rust"
+            NAME=$(grep -E '^name\s*=' Cargo.toml | head -1 | sed 's/.*=\s*"\(.*\)".*/\1/')
+            MAIN="src/main.rs"
+            echo "rust_version=stable" >> $GITHUB_OUTPUT
+            
+          elif [ -f "package.json" ]; then
+            LANG="nodejs"
+            NAME=$(jq -r '.name // "app"' package.json)
+            NODE_VER=$(jq -r '.engines.node // "20"' package.json | grep -oE '[0-9]+' | head -1)
+            echo "node_version=${NODE_VER:-20}" >> $GITHUB_OUTPUT
+            MAIN="package.json"
+            
+          elif [ -f "requirements.txt" ] || [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
+            LANG="python"
+            echo "python_version=3.11" >> $GITHUB_OUTPUT
+            NAME=$(basename "${{ github.repository }}")
+            
+            # Find main Python file
+            for f in main.py app.py run.py src/main.py; do
+              if [ -f "$f" ]; then
+                MAIN="$f"
+                break
+              fi
+            done
+            MAIN=${MAIN:-"main.py"}
+            
+          else
+            echo "::error::Could not detect project language. Supported: Go, Rust, Node.js, Python"
+            exit 1
+          fi
+          
+          # Use configured values if provided
+          NAME="${{ env.PROJECT_NAME }}"
+          if [ -z "$NAME" ] || [ "$NAME" = "''" ]; then
+            NAME=$(basename "${{ github.repository }}")
+          fi
+          
+          MAIN_OVERRIDE="${{ env.MAIN_FILE }}"
+          if [ -n "$MAIN_OVERRIDE" ] && [ "$MAIN_OVERRIDE" != "''" ]; then
+            MAIN="$MAIN_OVERRIDE"
+          fi
+          
+          echo "language=$LANG" >> $GITHUB_OUTPUT
+          echo "project_name=$NAME" >> $GITHUB_OUTPUT
+          echo "main_file=$MAIN" >> $GITHUB_OUTPUT
+          
+          echo "📦 Detected: $LANG project '$NAME' (main: $MAIN)"
+
       - name: Determine version
         id: version
         run: |
-          # Priority: workflow_call input > workflow_dispatch input > tag ref > auto-generated
           if [ -n "${{ inputs.tag }}" ]; then
             VERSION="${{ inputs.tag }}"
           elif [ -n "${{ github.event.inputs.tag }}" ]; then
@@ -60,219 +150,293 @@ jobs:
           else
             VERSION="v$(date -u +%Y.%m.%d-%H%M%S)"
           fi
-          
-          # Ensure version starts with 'v'
-          if [[ ! "$VERSION" =~ ^v ]]; then
-            VERSION="v${VERSION}"
-          fi
+          [[ ! "$VERSION" =~ ^v ]] && VERSION="v${VERSION}"
           
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "📦 Using version: $VERSION"
+          echo "📦 Version: $VERSION"
 
-      - name: Ensure tag exists
+      - name: Create tag
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          
-          # Configure git
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Check if tag exists locally
-          if git rev-parse "$VERSION" >/dev/null 2>&1; then
-            echo "✅ Tag $VERSION exists locally"
-          else
-            echo "📌 Creating tag $VERSION..."
-            git tag -a "$VERSION" -m "Release $VERSION"
-          fi
-          
-          # Push tag (ignore error if already exists on remote)
-          git push origin "$VERSION" 2>/dev/null || echo "ℹ️ Tag may already exist on remote"
+          git tag -a "$VERSION" -m "Release $VERSION" 2>/dev/null || true
+          git push origin "$VERSION" 2>/dev/null || true
 
+  # ============================================================
+  # BUILD: Cross-platform builds
+  # ============================================================
   build:
-    name: Build (${{ matrix.goos }}-${{ matrix.goarch }})
-    needs: prepare
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    needs: detect
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          - goos: windows
-            goarch: amd64
+          - os: windows
+            arch: amd64
             runner: windows-latest
             ext: .exe
-          - goos: windows
-            goarch: arm64
+          - os: windows
+            arch: arm64
             runner: windows-latest
             ext: .exe
-          # macOS AMD64 - Intel runner (available until Aug 2027, replaces retired macos-13)
-          - goos: darwin
-            goarch: amd64
+          - os: darwin
+            arch: amd64
             runner: macos-15-intel
             ext: ''
-          # macOS ARM64 - Apple Silicon runner
-          - goos: darwin
-            goarch: arm64
+          - os: darwin
+            arch: arm64
             runner: macos-latest
             ext: ''
     
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
-
-      - name: Build binary
-        shell: bash
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 0
-        run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
-          mkdir -p build
-          OUTFILE="build/${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
-          COMMIT="${{ github.sha }}"
-          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          
-          echo "🔨 Building $OUTFILE for GOOS=$GOOS GOARCH=$GOARCH"
-          go build -ldflags "-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT:0:7}' -X 'main.BuildDate=${DATE}'" \
-            -o "$OUTFILE" ./cmd/server/
-          
-          echo "✅ Built: $OUTFILE"
-          ls -la build/
-
-      - name: Package artifact (Windows)
-        if: matrix.goos == 'windows'
-        id: package-win
-        shell: pwsh
-        run: |
-          $VERSION = "${{ needs.prepare.outputs.version }}"
-          $ARTNAME = "${{ env.BINARY_NAME }}-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
-          
-          New-Item -ItemType Directory -Force -Path release-package | Out-Null
-          Copy-Item build/* release-package/
-          if (Test-Path LICENSE) { Copy-Item LICENSE release-package/ }
-          if (Test-Path README.md) { Copy-Item README.md release-package/ }
-          if (Test-Path config.example.yaml) { Copy-Item config.example.yaml release-package/ }
-          
-          Compress-Archive -Path release-package/* -DestinationPath "${ARTNAME}.zip" -Force
-          Write-Host "📦 Created: ${ARTNAME}.zip"
-          echo "artifact=${ARTNAME}.zip" >> $env:GITHUB_OUTPUT
-
-      - name: Package artifact (macOS)
-        if: matrix.goos == 'darwin'
-        id: package-mac
-        shell: bash
-        run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
-          ARTNAME="${{ env.BINARY_NAME }}-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
-          
-          mkdir -p release-package
-          cp build/* release-package/
-          cp LICENSE README.md config.example.yaml release-package/ 2>/dev/null || true
-          
-          tar -czvf "${ARTNAME}.tar.gz" -C release-package .
-          echo "📦 Created: ${ARTNAME}.tar.gz"
-          echo "artifact=${ARTNAME}.tar.gz" >> $GITHUB_OUTPUT
-
-      - name: Upload artifact (Windows)
-        if: matrix.goos == 'windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.package-win.outputs.artifact }}
-          path: ${{ steps.package-win.outputs.artifact }}
-          retention-days: 7
-
-      - name: Upload artifact (macOS)
-        if: matrix.goos == 'darwin'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.package-mac.outputs.artifact }}
-          path: ${{ steps.package-mac.outputs.artifact }}
-          retention-days: 7
-
-  create-release:
-    name: Create GitHub Release
-    needs: [prepare, build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download all artifacts
+      # ===== GO BUILD =====
+      - name: Setup Go
+        if: needs.detect.outputs.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ needs.detect.outputs.go_version }}
+          cache: true
+
+      - name: Build (Go)
+        if: needs.detect.outputs.language == 'go'
+        shell: bash
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p build
+          NAME="${{ needs.detect.outputs.project_name }}"
+          MAIN="${{ needs.detect.outputs.main_file }}"
+          VERSION="${{ needs.detect.outputs.version }}"
+          
+          go build -ldflags "-s -w -X 'main.Version=${VERSION}'" \
+            -o "build/${NAME}${{ matrix.ext }}" "./${MAIN}"
+          
+          echo "✅ Built: build/${NAME}${{ matrix.ext }}"
+
+      # ===== RUST BUILD =====
+      - name: Setup Rust
+        if: needs.detect.outputs.language == 'rust'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'windows' && format('{0}-pc-windows-msvc', matrix.arch == 'amd64' && 'x86_64' || 'aarch64') || format('{0}-apple-darwin', matrix.arch == 'amd64' && 'x86_64' || 'aarch64') }}
+
+      - name: Build (Rust)
+        if: needs.detect.outputs.language == 'rust'
+        shell: bash
+        run: |
+          mkdir -p build
+          NAME="${{ needs.detect.outputs.project_name }}"
+          
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            TARGET="${{ matrix.arch == 'amd64' && 'x86_64' || 'aarch64' }}-pc-windows-msvc"
+          else
+            TARGET="${{ matrix.arch == 'amd64' && 'x86_64' || 'aarch64' }}-apple-darwin"
+          fi
+          
+          cargo build --release --target "$TARGET"
+          cp "target/$TARGET/release/${NAME}${{ matrix.ext }}" "build/"
+          
+          echo "✅ Built: build/${NAME}${{ matrix.ext }}"
+
+      # ===== NODE.JS BUILD =====
+      - name: Setup Node.js
+        if: needs.detect.outputs.language == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ needs.detect.outputs.node_version }}
+          cache: 'npm'
+
+      - name: Build (Node.js)
+        if: needs.detect.outputs.language == 'nodejs'
+        shell: bash
+        run: |
+          npm ci
+          
+          # Check if electron-builder exists
+          if grep -q "electron-builder" package.json; then
+            if [ "${{ matrix.os }}" = "windows" ]; then
+              npx electron-builder --win --${{ matrix.arch }}
+            else
+              npx electron-builder --mac --${{ matrix.arch }}
+            fi
+            mkdir -p build
+            cp -r dist/* build/ 2>/dev/null || true
+          else
+            # Regular Node.js - use pkg or esbuild
+            npm run build 2>/dev/null || true
+            mkdir -p build
+            if [ -f "dist/index.js" ]; then
+              cp dist/* build/ 2>/dev/null || true
+            fi
+          fi
+
+      # ===== PYTHON BUILD =====
+      - name: Setup Python
+        if: needs.detect.outputs.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ needs.detect.outputs.python_version }}
+
+      - name: Build (Python)
+        if: needs.detect.outputs.language == 'python'
+        shell: bash
+        run: |
+          pip install pyinstaller
+          [ -f requirements.txt ] && pip install -r requirements.txt
+          
+          NAME="${{ needs.detect.outputs.project_name }}"
+          MAIN="${{ needs.detect.outputs.main_file }}"
+          
+          pyinstaller --onefile --name "${NAME}" "$MAIN"
+          mkdir -p build
+          cp "dist/${NAME}${{ matrix.ext }}" "build/"
+          
+          echo "✅ Built: build/${NAME}${{ matrix.ext }}"
+
+      # ===== PACKAGING =====
+      - name: Package (Windows)
+        if: matrix.os == 'windows'
+        id: pkg-win
+        shell: pwsh
+        run: |
+          $NAME = "${{ needs.detect.outputs.project_name }}"
+          $VERSION = "${{ needs.detect.outputs.version }}"
+          $ARTNAME = "${NAME}-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}"
+          
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item build/* release/
+          Copy-Item LICENSE*, README*, *.example.* release/ -ErrorAction SilentlyContinue
+          
+          Compress-Archive -Path release/* -DestinationPath "${ARTNAME}.zip" -Force
+          echo "artifact=${ARTNAME}.zip" >> $env:GITHUB_OUTPUT
+
+      - name: Package (macOS)
+        if: matrix.os == 'darwin'
+        id: pkg-mac
+        shell: bash
+        run: |
+          NAME="${{ needs.detect.outputs.project_name }}"
+          VERSION="${{ needs.detect.outputs.version }}"
+          ARTNAME="${NAME}-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}"
+          
+          mkdir -p release
+          cp build/* release/
+          cp LICENSE* README* *.example.* release/ 2>/dev/null || true
+          
+          # Create tar.gz
+          tar -czvf "${ARTNAME}.tar.gz" -C release .
+          echo "artifact=${ARTNAME}.tar.gz" >> $GITHUB_OUTPUT
+          echo "artname=${ARTNAME}" >> $GITHUB_OUTPUT
+
+      - name: Create DMG (macOS)
+        if: matrix.os == 'darwin'
+        id: dmg
+        shell: bash
+        run: |
+          NAME="${{ needs.detect.outputs.project_name }}"
+          VERSION="${{ needs.detect.outputs.version }}"
+          ARTNAME="${NAME}-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}"
+          
+          hdiutil create -volname "${NAME}" \
+            -srcfolder release \
+            -ov -format UDZO \
+            "${ARTNAME}.dmg"
+          
+          echo "dmg=${ARTNAME}.dmg" >> $GITHUB_OUTPUT
+
+      # ===== UPLOAD =====
+      - name: Upload (Windows)
+        if: matrix.os == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg-win.outputs.artifact }}
+          path: ${{ steps.pkg-win.outputs.artifact }}
+
+      - name: Upload (macOS tar.gz)
+        if: matrix.os == 'darwin'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg-mac.outputs.artifact }}
+          path: ${{ steps.pkg-mac.outputs.artifact }}
+
+      - name: Upload (macOS DMG)
+        if: matrix.os == 'darwin' && steps.dmg.outputs.dmg != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.dmg.outputs.dmg }}
+          path: ${{ steps.dmg.outputs.dmg }}
+
+  # ============================================================
+  # RELEASE: Create GitHub Release
+  # ============================================================
+  release:
+    name: Create Release
+    needs: [detect, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Prepare artifacts for release
+      - name: Prepare files
         id: files
         run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
-          echo "📁 Downloaded structure:"
-          find artifacts -type f || true
-          
-          # Move all files to root directory for easier upload
           mkdir -p release-files
-          find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec cp {} release-files/ \; || true
-          
-          echo "📦 Files to upload:"
-          ls -la release-files/ || echo "No files found"
-          
-          # Count files
-          FILE_COUNT=$(find release-files -type f 2>/dev/null | wc -l || echo "0")
-          echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
-          
-          if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "::warning::No release files found!"
-          else
-            echo "✅ Found $FILE_COUNT files for release"
-          fi
+          find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" -o -name "*.dmg" \) -exec cp {} release-files/ \;
+          ls -la release-files/
+          echo "count=$(find release-files -type f | wc -l)" >> $GITHUB_OUTPUT
 
       - name: Create Release
-        if: steps.files.outputs.file_count != '0'
+        if: steps.files.outputs.count != '0'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.prepare.outputs.version }}
-          name: Release ${{ needs.prepare.outputs.version }}
+          tag_name: ${{ needs.detect.outputs.version }}
+          name: Release ${{ needs.detect.outputs.version }}
           body: |
-            ${{ github.event.inputs.release_body || 'Automated release from GitHub Actions' }}
-            
             ## 📥 Downloads
-            | Platform | Architecture | File |
-            |----------|--------------|------|
-            | Windows | AMD64 (x64) | `cli-proxy-api-*-windows-amd64.zip` |
-            | Windows | ARM64 | `cli-proxy-api-*-windows-arm64.zip` |
-            | macOS | AMD64 (Intel) | `cli-proxy-api-*-darwin-amd64.tar.gz` |
-            | macOS | ARM64 (Apple Silicon) | `cli-proxy-api-*-darwin-arm64.tar.gz` |
             
-            ## 🔧 Installation
-            1. Download the appropriate file for your platform
-            2. Extract the archive
-            3. Run the `cli-proxy-api` executable
+            | Platform | Architecture | Files |
+            |----------|--------------|-------|
+            | **Windows** | AMD64 (x64) | `.zip` |
+            | **Windows** | ARM64 | `.zip` |
+            | **macOS** | Intel | `.tar.gz`, `.dmg` |
+            | **macOS** | Apple Silicon (M1/M2/M3) ✅ | `.tar.gz`, `.dmg` |
+            
+            ### Installation
+            
+            **macOS (.dmg)**
+            1. Download `.dmg` for your Mac (Intel or Apple Silicon)
+            2. Double-click to mount
+            3. Run from Terminal: `./${{ needs.detect.outputs.project_name }}`
+            
+            **Windows (.zip)**
+            1. Download and extract `.zip`
+            2. Run `.exe` from Command Prompt
+            
+            ---
+            *Built with [Universal Build Workflow](https://github.com)*
           files: release-files/*
           draft: false
           prerelease: false
           generate_release_notes: true
-          fail_on_unmatched_files: false
           make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Summary
         run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
-          echo "## 🎉 Release Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Version:** $VERSION" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Files uploaded:** ${{ steps.files.outputs.file_count }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "📥 **Download from:** [Releases](https://github.com/${{ github.repository }}/releases/tag/$VERSION)" >> $GITHUB_STEP_SUMMARY
+          echo "## 🎉 Release ${{ needs.detect.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Language:** ${{ needs.detect.outputs.language }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Download:** [Releases](https://github.com/${{ github.repository }}/releases)" >> $GITHUB_STEP_SUMMARY
