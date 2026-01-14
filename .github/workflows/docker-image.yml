@@ -1,46 +1,125 @@
-name: docker-image
+# 🐳 Universal Docker Image Build Workflow
+# Supports: Go, Rust, Node.js, Python (auto-detected via Dockerfile)
+# 
+# Requirements:
+# - Dockerfile in repo root
+# - DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets (optional for public repos)
+
+name: Docker Image
 
 on:
   push:
     tags:
-      - v*
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: 'Push image to registry'
+        type: boolean
+        default: true
 
 env:
-  APP_NAME: CLIProxyAPI
-  DOCKERHUB_REPO: eceasy/cli-proxy-api
+  # ===== CONFIGURATION =====
+  # Leave empty to auto-detect from repository name
+  IMAGE_NAME: ''
+  # Docker registry (dockerhub, ghcr.io, etc)
+  REGISTRY: 'docker.io'
+  # DockerHub organization/user (leave empty for ghcr.io)
+  DOCKERHUB_ORG: ''
 
 jobs:
-  docker:
+  build:
+    name: Build Docker Image
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect settings
+        id: detect
+        run: |
+          # Auto-detect image name
+          if [ -n "${{ env.IMAGE_NAME }}" ]; then
+            NAME="${{ env.IMAGE_NAME }}"
+          else
+            NAME=$(basename "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          fi
+          
+          # Determine registry
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            ORG="${{ env.DOCKERHUB_ORG }}"
+            if [ -z "$ORG" ]; then
+              ORG="${{ secrets.DOCKERHUB_USERNAME }}"
+            fi
+            FULL_NAME="${ORG}/${NAME}"
+            REGISTRY="docker.io"
+          else
+            FULL_NAME="ghcr.io/${{ github.repository_owner }}/${NAME}"
+            REGISTRY="ghcr.io"
+          fi
+          
+          echo "image_name=$FULL_NAME" >> $GITHUB_OUTPUT
+          echo "registry=$REGISTRY" >> $GITHUB_OUTPUT
+          echo "📦 Image: $FULL_NAME"
+
+      - name: Generate metadata
+        id: meta
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+          COMMIT=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+          echo "build_date=$BUILD_DATE" >> $GITHUB_OUTPUT
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
       - name: Login to DockerHub
+        if: secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != ''
         uses: docker/login-action@v3
         with:
+          registry: docker.io
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Generate Build Metadata
-        run: |
-          echo VERSION=`git describe --tags --always --dirty` >> $GITHUB_ENV
-          echo COMMIT=`git rev-parse --short HEAD` >> $GITHUB_ENV
-          echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
+
+      - name: Login to GitHub Container Registry
+        if: secrets.DOCKERHUB_USERNAME == ''
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: |
-            linux/amd64
-            linux/arm64
-          push: true
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event.inputs.push_image != 'false' }}
           build-args: |
-            VERSION=${{ env.VERSION }}
-            COMMIT=${{ env.COMMIT }}
-            BUILD_DATE=${{ env.BUILD_DATE }}
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ steps.meta.outputs.commit }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
           tags: |
-            ${{ env.DOCKERHUB_REPO }}:latest
-            ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
+            ${{ steps.detect.outputs.image_name }}:latest
+            ${{ steps.detect.outputs.image_name }}:${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          echo "## 🐳 Docker Image Built" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ steps.detect.outputs.image_name }}:${{ steps.meta.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Platforms:** linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
